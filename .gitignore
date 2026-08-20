@@ -1,5 +1,6 @@
 .direnv/
 .derivedData/
+.DS_Store
 
 DerivedData/
 build/

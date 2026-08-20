@@ -23,6 +23,31 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.resumeplayer.app
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_CFBundleDisplayName: ResumePlayer
+    info:
+      path: ResumePlayer/Info.plist
+      properties:
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: MP3 Audio
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Alternate
+            LSItemContentTypes:
+              - public.mp3
+          - CFBundleTypeName: MPEG-4 Audio
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Alternate
+            LSItemContentTypes:
+              - public.mpeg-4-audio
+              - com.apple.m4a-audio
+          - CFBundleTypeName: WAV Audio
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Alternate
+            LSItemContentTypes:
+              - com.microsoft.waveform-audio
+          - CFBundleTypeName: AIFF Audio
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Alternate
+            LSItemContentTypes:
+              - public.aiff-audio
     scheme:
       testTargets:
         - ResumePlayerTests

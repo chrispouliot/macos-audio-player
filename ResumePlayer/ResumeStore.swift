@@ -13,6 +13,19 @@ actor ResumeStore {
 
     private let storageURL: URL
 
+    static var production: ResumeStore {
+        let applicationSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first ?? FileManager.default.homeDirectoryForCurrentUser
+
+        return ResumeStore(
+            storageURL: applicationSupport
+                .appendingPathComponent("ResumePlayer", isDirectory: true)
+                .appendingPathComponent("resume-positions.json")
+        )
+    }
+
     init(storageURL: URL) {
         self.storageURL = storageURL
     }
