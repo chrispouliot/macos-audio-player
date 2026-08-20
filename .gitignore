@@ -1,0 +1,12 @@
+.direnv/
+.derivedData/
+
+DerivedData/
+build/
+
+*.xcuserstate
+xcuserdata/
+
+# XcodeGen output
+*.xcodeproj/
+*.xcworkspace/

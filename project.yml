@@ -1,0 +1,40 @@
+name: ResumePlayer
+
+options:
+  bundleIdPrefix: com.resumeplayer
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+settings:
+  base:
+    LD: "$(TOOLCHAIN_DIR)/usr/bin/clang"
+    SWIFT_VERSION: "6.0"
+
+targets:
+  ResumePlayer:
+    type: application
+    platform: macOS
+    sources:
+      - path: ResumePlayer
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.resumeplayer.app
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: ResumePlayer
+    scheme:
+      testTargets:
+        - ResumePlayerTests
+
+  ResumePlayerTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: ResumePlayerTests
+    dependencies:
+      - target: ResumePlayer
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.resumeplayer.tests
+        GENERATE_INFOPLIST_FILE: YES
