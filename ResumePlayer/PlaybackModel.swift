@@ -3,6 +3,7 @@ import AppKit
 import Combine
 import CoreMedia
 import Foundation
+import MediaPlayer
 import UniformTypeIdentifiers
 
 @MainActor
@@ -14,6 +15,12 @@ final class PlaybackModel: ObservableObject {
     @Published private(set) var isLoading = false
     @Published private(set) var errorMessage: String?
     @Published private(set) var defaultPlayerStatusMessage: String?
+    @Published private(set) var trackTitle: String?
+    @Published private(set) var trackArtist: String?
+    @Published private(set) var trackAlbum: String?
+    @Published private(set) var artwork: NSImage?
+    @Published private(set) var volume: Double = 0.72
+    @Published private(set) var isMuted = false
 
     private let resumeStore: ResumeStore
     private var player: AVPlayer?
@@ -31,6 +38,9 @@ final class PlaybackModel: ObservableObject {
     private var lastPersistedTime: TimeInterval = 0
     private var loadID = UUID()
     private var defaultPlayerRequestInFlight = false
+    private var nowPlayingInfo: [String: Any]?
+    private var lastPublishedElapsedTime: TimeInterval?
+    private var remoteCommandHandlers: [(command: MPRemoteCommand, token: Any)] = []
 
     private static let supportedAudioContentTypes: [UTType] = [
         .mp3,
@@ -42,9 +52,12 @@ final class PlaybackModel: ObservableObject {
 
     init(resumeStore: ResumeStore = .production) {
         self.resumeStore = resumeStore
+        registerRemoteCommands()
     }
 
     isolated deinit {
+        unregisterRemoteCommands()
+        clearNowPlaying()
         if let timeObserver, let player {
             player.removeTimeObserver(timeObserver)
         }
@@ -134,18 +147,27 @@ final class PlaybackModel: ObservableObject {
 
         let item = AVPlayerItem(url: url)
         let newPlayer = AVPlayer(playerItem: item)
+        newPlayer.volume = Float(volume)
+        newPlayer.isMuted = isMuted
         playerItem = item
         player = newPlayer
         selectedURL = url
+        trackTitle = Self.fallbackTitle(for: url)
+        trackArtist = nil
+        trackAlbum = nil
+        artwork = nil
         currentTime = 0
         duration = 0
-        isPlaying = false
+        setPlaybackState(false)
         isLoading = true
         pendingResumePosition = nil
         resumePositionLoaded = false
         hasStartedPlayback = false
         lastPersistedTime = 0
+        updateRemoteCommandAvailability()
+        refreshNowPlayingInfo(forceElapsedUpdate: true)
         observe(item: item, player: newPlayer, loadID: newLoadID)
+        loadMetadata(for: url, loadID: newLoadID)
 
         do {
             pendingResumePosition = try await resumeStore.position(for: url)
@@ -169,6 +191,10 @@ final class PlaybackModel: ObservableObject {
         pendingResumePosition = nil
         resumePositionLoaded = false
         hasStartedPlayback = false
+        trackTitle = nil
+        trackArtist = nil
+        trackAlbum = nil
+        artwork = nil
     }
 
     func togglePlayback() {
@@ -176,7 +202,7 @@ final class PlaybackModel: ObservableObject {
 
         if isPlaying {
             player.pause()
-            isPlaying = false
+            setPlaybackState(false)
             saveCurrentProgressInBackground()
             return
         }
@@ -190,7 +216,7 @@ final class PlaybackModel: ObservableObject {
             seekPlayer(to: 0, resumeAfterSeek: true)
         } else {
             player.play()
-            isPlaying = true
+            setPlaybackState(true)
         }
     }
 
@@ -199,6 +225,24 @@ final class PlaybackModel: ObservableObject {
         let boundedTime = max(0, min(seconds, duration > 0 ? duration : seconds))
         let wasPlaying = isPlaying
         seekPlayer(to: boundedTime, resumeAfterSeek: wasPlaying)
+    }
+
+    func skipBackward() {
+        skip(by: -15)
+    }
+
+    func skipForward() {
+        skip(by: 15)
+    }
+
+    func setVolume(_ value: Double) {
+        volume = max(0, min(value, 1))
+        player?.volume = Float(volume)
+    }
+
+    func toggleMute() {
+        isMuted.toggle()
+        player?.isMuted = isMuted
     }
 
     func saveForInactivity() {
@@ -231,7 +275,7 @@ final class PlaybackModel: ObservableObject {
             let isPlaying = player.timeControlStatus == .playing
             Task { @MainActor [weak self] in
                 guard let self, self.loadID == loadID, self.player === player else { return }
-                self.isPlaying = isPlaying
+                self.setPlaybackState(isPlaying)
             }
         }
 
@@ -264,12 +308,13 @@ final class PlaybackModel: ObservableObject {
             startPlaybackWhenReady()
         case .failed:
             isLoading = false
-            isPlaying = false
+            setPlaybackState(false)
             errorMessage = "Unable to play audio: \(item.error?.localizedDescription ?? "Unknown playback error")"
         case .unknown:
             isLoading = true
         @unknown default:
             isLoading = false
+            setPlaybackState(false)
             errorMessage = "Unable to determine the audio file state."
         }
     }
@@ -278,6 +323,71 @@ final class PlaybackModel: ObservableObject {
         let seconds = item.duration.seconds
         guard seconds.isFinite, seconds > 0 else { return }
         duration = seconds
+        updateRemoteCommandAvailability()
+        refreshNowPlayingInfo(forceElapsedUpdate: true)
+    }
+
+    private func skip(by offset: TimeInterval) {
+        guard playerItem != nil, duration > 0 else { return }
+        seek(to: currentTime + offset)
+    }
+
+    private func loadMetadata(for url: URL, loadID: UUID) {
+        let asset = AVURLAsset(url: url)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+
+            do {
+                let metadataItems = try await asset.load(.commonMetadata)
+                var title: String?
+                var artist: String?
+                var author: String?
+                var album: String?
+                var artworkData: Data?
+
+                for item in metadataItems {
+                    switch item.identifier {
+                    case .commonIdentifierTitle:
+                        title = try? await item.load(.stringValue)
+                    case .commonIdentifierArtist:
+                        artist = try? await item.load(.stringValue)
+                    case .commonIdentifierAuthor:
+                        author = try? await item.load(.stringValue)
+                    case .commonIdentifierAlbumName:
+                        album = try? await item.load(.stringValue)
+                    case .commonIdentifierArtwork:
+                        artworkData = try? await item.load(.dataValue)
+                    default:
+                        continue
+                    }
+                }
+
+                guard self.loadID == loadID, self.selectedURL == url else { return }
+                self.trackTitle = Self.nonEmpty(title) ?? Self.fallbackTitle(for: url)
+                self.trackArtist = Self.nonEmpty(artist) ?? Self.nonEmpty(author)
+                self.trackAlbum = Self.nonEmpty(album)
+                self.artwork = artworkData.flatMap(NSImage.init(data:))
+                self.refreshNowPlayingInfo(forceElapsedUpdate: true)
+            } catch {
+                guard self.loadID == loadID, self.selectedURL == url else { return }
+                self.trackTitle = Self.fallbackTitle(for: url)
+                self.trackArtist = nil
+                self.trackAlbum = nil
+                self.artwork = nil
+                self.refreshNowPlayingInfo(forceElapsedUpdate: true)
+            }
+        }
+    }
+
+    private static func nonEmpty(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmedValue = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmedValue.isEmpty ? nil : trimmedValue
+    }
+
+    private static func fallbackTitle(for url: URL) -> String {
+        let filename = url.deletingPathExtension().lastPathComponent
+        return filename.isEmpty ? "Untitled Audio" : filename
     }
 
     private func startPlaybackWhenReady() {
@@ -301,7 +411,7 @@ final class PlaybackModel: ObservableObject {
         } else {
             player.play()
             isLoading = false
-            isPlaying = true
+            setPlaybackState(true)
         }
     }
 
@@ -316,9 +426,11 @@ final class PlaybackModel: ObservableObject {
                 self.isLoading = false
                 if finished, resumeAfterSeek {
                     player.play()
-                    self.isPlaying = true
+                    self.setPlaybackState(true)
                 } else if !resumeAfterSeek {
-                    self.isPlaying = false
+                    self.setPlaybackState(false)
+                } else {
+                    self.refreshNowPlayingInfo(forceElapsedUpdate: true)
                 }
             }
         }
@@ -328,6 +440,7 @@ final class PlaybackModel: ObservableObject {
         let seconds = time.seconds
         guard seconds.isFinite else { return }
         currentTime = max(0, seconds)
+        refreshNowPlayingInfo()
 
         if duration > 0, currentTime - lastPersistedTime >= 10 {
             lastPersistedTime = currentTime
@@ -337,7 +450,8 @@ final class PlaybackModel: ObservableObject {
 
     private func handlePlaybackEnded() {
         currentTime = duration > 0 ? duration : currentTime
-        isPlaying = false
+        setPlaybackState(false)
+        MPNowPlayingInfoCenter.default().playbackState = .stopped
         isLoading = false
         saveCurrentProgressInBackground()
     }
@@ -366,8 +480,166 @@ final class PlaybackModel: ObservableObject {
         }
     }
 
+    private func setPlaybackState(_ playing: Bool) {
+        isPlaying = playing
+        guard selectedURL != nil else { return }
+        MPNowPlayingInfoCenter.default().playbackState = playing ? .playing : .paused
+        refreshNowPlayingInfo(forceElapsedUpdate: true)
+    }
+
+    private func refreshNowPlayingInfo(forceElapsedUpdate: Bool = false) {
+        guard selectedURL != nil else {
+            clearNowPlaying()
+            return
+        }
+
+        let elapsedTimeChanged = lastPublishedElapsedTime.map {
+            abs($0 - currentTime) >= 1
+        } ?? true
+        guard forceElapsedUpdate || elapsedTimeChanged || nowPlayingInfo == nil else { return }
+
+        var info = nowPlayingInfo ?? [:]
+        info[MPMediaItemPropertyTitle] = trackTitle ?? "Untitled Audio"
+        info[MPNowPlayingInfoPropertyMediaType] = NSNumber(value: MPNowPlayingInfoMediaType.audio.rawValue)
+
+        if let trackArtist {
+            info[MPMediaItemPropertyArtist] = trackArtist
+        } else {
+            info.removeValue(forKey: MPMediaItemPropertyArtist)
+        }
+
+        if let trackAlbum {
+            info[MPMediaItemPropertyAlbumTitle] = trackAlbum
+        } else {
+            info.removeValue(forKey: MPMediaItemPropertyAlbumTitle)
+        }
+
+        if let artwork, artwork.size.width > 0, artwork.size.height > 0 {
+            info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: artwork.size) { _ in artwork }
+        } else {
+            info.removeValue(forKey: MPMediaItemPropertyArtwork)
+        }
+
+        if duration > 0 {
+            info[MPMediaItemPropertyPlaybackDuration] = duration
+        } else {
+            info.removeValue(forKey: MPMediaItemPropertyPlaybackDuration)
+        }
+
+        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = currentTime
+        info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? 1.0 : 0.0
+        nowPlayingInfo = info
+        lastPublishedElapsedTime = currentTime
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+    }
+
+    private func clearNowPlaying() {
+        nowPlayingInfo = nil
+        lastPublishedElapsedTime = nil
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        MPNowPlayingInfoCenter.default().playbackState = .stopped
+    }
+
+    private func registerRemoteCommands() {
+        let commandCenter = MPRemoteCommandCenter.shared()
+        addRemoteHandler(to: commandCenter.playCommand) { [weak self] _ in
+            guard let self else { return .noSuchContent }
+            guard self.selectedURL != nil, let item = self.playerItem else { return .noSuchContent }
+            guard item.status == .readyToPlay else { return .commandFailed }
+            if !self.isPlaying {
+                self.togglePlayback()
+            }
+            return .success
+        }
+        addRemoteHandler(to: commandCenter.pauseCommand) { [weak self] _ in
+            guard let self else { return .noSuchContent }
+            guard self.selectedURL != nil, self.playerItem != nil else { return .noSuchContent }
+            if self.isPlaying {
+                self.togglePlayback()
+            }
+            return .success
+        }
+        addRemoteHandler(to: commandCenter.togglePlayPauseCommand) { [weak self] _ in
+            guard let self else { return .noSuchContent }
+            guard self.selectedURL != nil, let item = self.playerItem else { return .noSuchContent }
+            guard item.status == .readyToPlay else { return .commandFailed }
+            self.togglePlayback()
+            return .success
+        }
+        addRemoteHandler(to: commandCenter.changePlaybackPositionCommand) { [weak self] event in
+            guard let self, let event = event as? MPChangePlaybackPositionCommandEvent else {
+                return .commandFailed
+            }
+            guard self.selectedURL != nil, self.playerItem != nil, self.duration > 0 else {
+                return .noSuchContent
+            }
+            guard event.positionTime.isFinite else { return .commandFailed }
+            self.seek(to: event.positionTime)
+            return .success
+        }
+        commandCenter.skipBackwardCommand.preferredIntervals = [NSNumber(value: 15)]
+        addRemoteHandler(to: commandCenter.skipBackwardCommand) { [weak self] _ in
+            guard let self, self.selectedURL != nil, self.playerItem != nil, self.duration > 0 else {
+                return .noSuchContent
+            }
+            self.skipBackward()
+            return .success
+        }
+        commandCenter.skipForwardCommand.preferredIntervals = [NSNumber(value: 15)]
+        addRemoteHandler(to: commandCenter.skipForwardCommand) { [weak self] _ in
+            guard let self, self.selectedURL != nil, self.playerItem != nil, self.duration > 0 else {
+                return .noSuchContent
+            }
+            self.skipForward()
+            return .success
+        }
+
+        commandCenter.nextTrackCommand.isEnabled = false
+        commandCenter.previousTrackCommand.isEnabled = false
+        updateRemoteCommandAvailability(hasFile: false)
+    }
+
+    private func addRemoteHandler(
+        to command: MPRemoteCommand,
+        handler: @escaping @MainActor (MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus
+    ) {
+        let token = command.addTarget(handler: handler)
+        remoteCommandHandlers.append((command: command, token: token))
+    }
+
+    private func updateRemoteCommandAvailability(hasFile: Bool? = nil) {
+        let hasFile = hasFile ?? (selectedURL != nil)
+        let commandCenter = MPRemoteCommandCenter.shared()
+        commandCenter.playCommand.isEnabled = hasFile
+        commandCenter.pauseCommand.isEnabled = hasFile
+        commandCenter.togglePlayPauseCommand.isEnabled = hasFile
+        commandCenter.changePlaybackPositionCommand.isEnabled = hasFile && duration > 0
+        commandCenter.skipBackwardCommand.isEnabled = hasFile && duration > 0
+        commandCenter.skipForwardCommand.isEnabled = hasFile && duration > 0
+        commandCenter.nextTrackCommand.isEnabled = false
+        commandCenter.previousTrackCommand.isEnabled = false
+    }
+
+    private func unregisterRemoteCommands() {
+        for handler in remoteCommandHandlers {
+            handler.command.removeTarget(handler.token)
+        }
+        remoteCommandHandlers.removeAll()
+        let commandCenter = MPRemoteCommandCenter.shared()
+        commandCenter.playCommand.isEnabled = false
+        commandCenter.pauseCommand.isEnabled = false
+        commandCenter.togglePlayPauseCommand.isEnabled = false
+        commandCenter.changePlaybackPositionCommand.isEnabled = false
+        commandCenter.skipBackwardCommand.isEnabled = false
+        commandCenter.skipForwardCommand.isEnabled = false
+        commandCenter.nextTrackCommand.isEnabled = false
+        commandCenter.previousTrackCommand.isEnabled = false
+    }
+
     private func stopPlaybackAndReleaseResource() {
         loadID = UUID()
+        clearNowPlaying()
+        updateRemoteCommandAvailability(hasFile: false)
         if let timeObserver, let player {
             player.removeTimeObserver(timeObserver)
         }
